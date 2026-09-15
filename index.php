@@ -27,6 +27,15 @@ spl_autoload_register(
 use \Firebase\JWT\JWT;
 require_once 'config_jwt.php';
 
+if (
+    $_SERVER['REQUEST_METHOD'] === 'GET'
+    && trim((string) ($_GET['action'] ?? ''), '/') === 'health'
+) {
+    outputJson([
+        'success' => true,
+        'data' => ['status' => 'ok']
+    ]);
+}
 
 
 // ----------------- ROUTER ------------------
