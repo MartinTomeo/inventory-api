@@ -380,31 +380,6 @@ function initDB(): SQLite3
     return new SQLite3($path);
 }
 
-function postReset() {
-
-    $db = initDB();
-    $sqlFile = __DIR__ . '/dump.sql';
-    
-    if (!file_exists($sqlFile)) {
-        outputJson(['error' => "dump.sql not found!"], 500);
-    }
-
-    $sql = file_get_contents($sqlFile);
-
-    if ($sql === false) {
-        outputJson(['error' => "failed to read file!"], 500);
-    }
-
-    if (!$db->exec($sql)) {
-        error_log($db->lastErrorMsg());
-        outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR','message' => 'Internal server error']], 500);
-    }
-
-    
-    outputJson(['status' => 'DB Reset']);
-
-}
-
 // ----------------- Autenticacion y Autorizacion ------------------
 
 function authenticate($email, $password)
