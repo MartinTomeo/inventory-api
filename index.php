@@ -1,19 +1,22 @@
 <?php
-header('Access-Control-Allow-Origin: *');
+$frontendOrigin = getenv('FRONTEND_ORIGIN') ?: 'http://localhost:4200';
 
+header("Access-Control-Allow-Origin: $frontendOrigin");
+header('Access-Control-Allow-Credentials: true');
 header(
     'Access-Control-Allow-Headers: ' .
     'Authorization, Content-Type, Accept, Origin, X-Requested-With, Access-Control-Request-Method'
 );
-
-header('Access-Control-Allow-Methods: POST, GET, PATCH, DELETE');
-header('Allow: GET, POST, PATCH, DELETE');
-
+header('Access-Control-Allow-Methods: POST, GET, PATCH, DELETE, OPTIONS');
+header('Vary: Origin');
 date_default_timezone_set('America/Argentina/Buenos_Aires');
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {    
-   return 0;    
-}  
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+
+    http_response_code(204);
+    exit;
+
+}
 
 spl_autoload_register(
     function ($class_name) {
@@ -26,6 +29,9 @@ spl_autoload_register(
 
 use \Firebase\JWT\JWT;
 require_once 'config_jwt.php';
+
+
+
 
 if (
     $_SERVER['REQUEST_METHOD'] === 'GET'
@@ -46,7 +52,9 @@ $resource = strtolower($action[0] ?? '');
 
 $authRoutes = [
     'post:login' => 'postLogin',
-    'get:checkstatus' => 'getCheckStatus',
+    'post:refresh' => 'postRefresh',
+    'get:checkstatus' => 'getCheckStatus'
+    
 ];
 
 $routeKey = $method . ':' . $resource;
@@ -68,17 +76,13 @@ if (!isset($authRoutes[$routeKey]) && $method === 'post' && count($params) === 1
     $nameFoo = 'getStockByLine';
     $params = [$params[1]];
 
- }elseif (!isset($authRoutes[$routeKey]) && $method === 'get' && $resource === 'subscriptions' && count($params) === 1
+}elseif (!isset($authRoutes[$routeKey]) && $method === 'get' && $resource === 'subscriptions' && count($params) === 1
     && strtolower($params[0]) === 'options') 
 {
     $nameFoo = 'getSubscriptionOptions';
     $params = [];
 
-} elseif ($method === 'get' && $resource === 'logs' && count($params) === 1)
-{
-    $nameFoo = 'getLogsByName';
-
-}  elseif (!isset($authRoutes[$routeKey]) && count($params) > 0 && ($method === 'get' || $method === 'patch')) {
+} elseif (!isset($authRoutes[$routeKey]) && count($params) > 0 && ($method === 'get' || $method === 'patch')) {
     
     if (is_numeric($params[0])) {
 
@@ -100,90 +104,101 @@ if (function_exists($nameFoo)) {
 
     outputJson(['success' => false, 'error' => ['code' => 'ENDPOINT_NOT_FOUND', 'message' => 'Endpoint not found']], 404);
 }
+
 // ----------------- FUNCIONES DE SOPORTE ------------------
 
+function getUsersUploadDir()
+{
+    return __DIR__ . '/uploads/users/';
+}
+
+function getStockUploadDir()
+{
+    return __DIR__ . '/uploads/stock/';
+}
 
 function outputJson($data = null, int $code = 200): never
 {
     http_response_code($code);
     header('Content-Type: application/json');
-    recordRequestLog($code);
     echo json_encode($data, JSON_UNESCAPED_UNICODE);
     exit;
 }
 
 
+function createAccessToken(int $userId): string
+{
+    $payload = [ 'uid' => $userId, 'exp' => time() + JWT_EXP ];
+    return JWT::encode($payload, JWT_KEY, JWT_ALG);
+}
+
+
+function createRefreshToken(): string
+{
+    return bin2hex(random_bytes(32));
+}
+
+
 function saveUploadedImage($file, $uploadDir)
 {
+    
+    //Validaciones
 
     if (!isset($file) || $file['error'] === UPLOAD_ERR_NO_FILE) {
         return ['success' => false, 'code' => 'PHOTO_REQUIRED', 'message' => 'A photo is required'];
     }
 
-    if ($file['error'] !== UPLOAD_ERR_OK) {
+    if ($file['error'] === UPLOAD_ERR_INI_SIZE || $file['error'] === UPLOAD_ERR_FORM_SIZE) {
+        return ['success' => false, 'code' => 'FILE_TOO_LARGE', 'message' => 'The photo exceeds the maximum allowed size'];
+    }
 
+    if ($file['error'] !== UPLOAD_ERR_OK) {
         error_log('Image upload error: ' . $file['error']);
         return ['success' => false, 'code' => 'FILE_UPLOAD_ERROR', 'message' => 'The photo could not be uploaded'];
-
     }
 
     $tmpName = $file['tmp_name'];
 
     if (!is_uploaded_file($tmpName)) {
-
         return ['success' => false, 'code' => 'INVALID_UPLOAD', 'message' => 'Invalid uploaded file'];
-
     }
 
-
-    $maxFileSize = 5 * 1024 * 1024; // 5 MB
+    $maxFileSize = 5 * 1024 * 1024;
 
     if ($file['size'] > $maxFileSize) {
-
         return ['success' => false, 'code' => 'FILE_TOO_LARGE', 'message' => 'The photo exceeds the maximum allowed size'];
-
     }
-
 
     $mimeType = mime_content_type($tmpName);
 
-    $allowedTypes = [
+    $allowedMimeTypes = [
         'image/jpeg' => 'jpg',
         'image/png'  => 'png',
         'image/webp' => 'webp'
     ];
 
-    if (!isset($allowedTypes[$mimeType])) {
-
-        return ['success' => false, 'code' => 'INVALID_IMAGE_TYPE', 'message' => 'The uploaded file is not a supported image type'];
-
+    if (!array_key_exists($mimeType, $allowedMimeTypes)) {
+        return ['success' => false, 'code' => 'INVALID_IMAGE_TYPE', 'message' => 'Invalid image type'];
     }
-
 
     if (!is_dir($uploadDir)) {
         if (!mkdir($uploadDir, 0755, true)) {
-
-            error_log('Could not create upload directory: ' . $uploadDir);
             return ['success' => false, 'code' => 'FILE_STORAGE_ERROR', 'message' => 'Could not prepare image storage'];
-
         }
     }
 
+    //Aca empiezo a crear el filename y guardo el archivo en uploads
 
-    $extension = $allowedTypes[$mimeType];
-    $fileName = bin2hex(random_bytes(16)) . '.' . $extension;
-    $destination = $uploadDir . $fileName;
-
+    $extension = $allowedMimeTypes[$mimeType];
+    $filename = bin2hex(random_bytes(16)) . '.' . $extension;
+    $destination = rtrim($uploadDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $filename;
 
     if (!move_uploaded_file($tmpName, $destination)) {
-
-        error_log('Could not move uploaded image to: ' . $destination);
-        return ['success' => false, 'code' => 'FILE_STORAGE_ERROR', 'message' => 'The photo could not be saved'];
+        return ['success' => false, 'code' => 'FILE_UPLOAD_ERROR', 'message' => 'The photo could not be saved'];
     }
 
-    return ['success' => true, 'fileName' => $fileName, 'path' => $destination];
+    return ['success' => true, 'fileName' => $filename];
 }
-
 
 function deleteImageFile(?string $fileName, string $uploadDir): void
 {
@@ -201,17 +216,8 @@ function deleteImageFile(?string $fileName, string $uploadDir): void
 }
 
 
-function getUsersUploadDir()
-{
-    return __DIR__ . '/uploads/users/';
-}
-
-function getStockUploadDir()
-{
-    return __DIR__ . '/uploads/stock/';
-}
-
 function findUserConflict(SQLite3 $db, ?string $username, ?string $email, ?int $excludeUserId = null): ?array {
+    
     $checks = [
         'username' => [
             'value' => $username, 'code' => 'USERNAME_ALREADY_EXISTS', 'message' => 'A user with that username already exists.'],
@@ -224,7 +230,7 @@ function findUserConflict(SQLite3 $db, ?string $username, ?string $email, ?int $
             continue;
         }
 
-        $sql = "SELECT id FROM users WHERE $field = :value";
+        $sql = "SELECT id FROM users WHERE $field COLLATE NOCASE = :value";
 
         if ($excludeUserId !== null) {
             $sql .= ' AND id != :excludeUserId';
@@ -310,66 +316,42 @@ function findStockConflict(SQLite3 $db, ?string $imei, ?int $line, ?int $exclude
     return null;
 }
 
-function recordRequestLog(int $statusCode): void
+function setRefreshTokenCookie( string $refreshToken, int $expiresAt ): bool
 {
-    static $recorded = false;
-
-    if ($recorded) {
-        return;
-    }
-
-    $recorded = true;
-
-    $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? '');
-
-    if ($method === 'OPTIONS') {
-        return;
-    }
-
-    // Tu router obtiene la ruta desde $_GET['action'].
-    $route = trim((string) ($_GET['action'] ?? ''), '/');
-
-    $username = $GLOBALS['requestLogUsername'] ?? 'anonymous';
-
-    // No se guardan el body, las contraseñas ni el JWT.
-    $action = '/' . $route . ' [HTTP ' . $statusCode . ']';
-
-    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-
-    $db = null;
-
-    try {
-        $db = initDB();
-
-        // Los errores de SQLite se capturan en el catch.
-        $db->enableExceptions(true);
-        $db->busyTimeout(500);
-
-        $stmt = $db->prepare(
-            'INSERT INTO logs (username, action, method, ip)
-             VALUES (:username, :action, :method, :ip)'
-        );
-
-        $stmt->bindValue(':username', $username, SQLITE3_TEXT);
-        $stmt->bindValue(':action', $action, SQLITE3_TEXT);
-        $stmt->bindValue(':method', $method, SQLITE3_TEXT);
-        $stmt->bindValue(':ip', $ip, SQLITE3_TEXT);
-
-        $result = $stmt->execute();
-        $result->finalize();
-        $stmt->close();
-
-    } catch (Throwable $e) {
-        // Un fallo del log no reemplaza la respuesta del endpoint.
-        error_log('Request logging error: ' . $e->getMessage());
-
-    } finally {
-        if ($db instanceof SQLite3) {
-            $db->close();
-        }
-    }
+    return setcookie(
+        REFRESH_COOKIE_NAME,
+        $refreshToken,
+        [
+            'expires' => $expiresAt,
+            'path' => '/',
+            'secure' => REFRESH_COOKIE_SECURE,
+            'httponly' => true,
+            'samesite' => 'None'
+        ]
+    );
 }
 
+
+function clearRefreshTokenCookie(): void
+{
+    setcookie(
+        REFRESH_COOKIE_NAME,
+        '',
+        [
+            'expires' => time() - 3600,
+            'path' => '/',
+            'secure' => REFRESH_COOKIE_SECURE,
+            'httponly' => true,
+            'samesite' => 'Lax'
+        ]
+    );
+}
+
+
+function isValidRefreshToken( mixed $refreshToken ): bool
+{
+    return is_string($refreshToken) && preg_match( '/^[a-f0-9]{64}$/D', $refreshToken ) === 1;
+}
 
 // ----------------- Establecer Base de datos ------------------
 
@@ -377,15 +359,49 @@ function initDB(): SQLite3
 {
     $path = getenv('DB_PATH') ?: __DIR__ . '/data.db';
 
-    return new SQLite3($path);
+    $db = new SQLite3($path);
+
+    if (!$db->exec('PRAGMA foreign_keys = ON')) {
+        throw new RuntimeException('Could not enable foreign keys');
+    }
+
+    return $db;
 }
+
+// ----------------- Solo para desarrollo ------------------
+/*
+function postReset() {
+
+    $db = initDB();
+    $sqlFile = __DIR__ . '/dump.sql';
+    
+    if (!file_exists($sqlFile)) {
+        outputJson(['error' => "dump.sql not found!"], 500);
+    }
+
+    $sql = file_get_contents($sqlFile);
+
+    if ($sql === false) {
+        outputJson(['error' => "failed to read file!"], 500);
+    }
+
+    if (!$db->exec($sql)) {
+        error_log($db->lastErrorMsg());
+        outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR','message' => 'Internal server error']], 500);
+    }
+
+    
+    outputJson(['status' => 'DB Reset']);
+
+}
+*/
 
 // ----------------- Autenticacion y Autorizacion ------------------
 
 function authenticate($email, $password)
 {
     $db = initDB();
-    $sql = 'SELECT id, username, password, role FROM users WHERE email = :email';
+    $sql = 'SELECT id, username, password, role FROM users WHERE email COLLATE NOCASE = :email';
     $stmt = $db->prepare($sql);
 
     if (!$stmt) {
@@ -410,22 +426,21 @@ function authenticate($email, $password)
         return false;
     }
 
-    return [
-        'id'       => (int) $user['id'],
-        'username' => $user['username'],
-        'role'     => (int) $user['role']
-    ];
+    return ['id' => (int) $user['id'], 'username' => $user['username']];
 }
 
 
 function postLogin()
 {
- 
-    $data = json_decode(file_get_contents('php://input'), true);
+
+    $data = json_decode(file_get_contents('php://input'),true);
 
     if (!is_array($data)) {
-        outputJson(['success' => false, 'error' => ['code' => 'INVALID_REQUEST', 'message' => 'Invalid JSON body']], 400);
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'INVALID_REQUEST', 'message' => 'Invalid JSON body']], 400);
     }
+
 
     if (!array_key_exists('email', $data) || !array_key_exists('password', $data)) {
         outputJson([
@@ -433,90 +448,253 @@ function postLogin()
             'error' => ['code' => 'MISSING_CREDENTIALS', 'message' => 'Email and password are required']], 400);
     }
 
+
     if (!is_string($data['email']) || !is_string($data['password'])) {
         outputJson([
             'success' => false,
             'error' => ['code' => 'INVALID_CREDENTIALS', 'message' => 'Invalid credentials format']], 400);
     }
 
-    $email = trim($data['email']);
+    $email = strtolower(trim($data['email']));
     $password = $data['password'];
 
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        outputJson(['success' => false, 'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email']], 400);
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email']], 400);
+
     }
 
     $logged = authenticate($email, $password);
 
     if ($logged === false) {
-        outputJson(['success' => false, 'error' => ['code' => 'INVALID_CREDENTIALS', 'message' => 'Invalid email or password']], 401);
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'INVALID_CREDENTIALS', 'message' => 'Invalid email or password']], 401);
     }
 
-    $GLOBALS['requestLogUsername'] = $logged['username'];
+    // Crear tokens y guardar refresh token
 
-    $now = time();
+    try {
 
-    $payload = [
-        'iss'  => 'inventario-api',
-        'aud'  => 'inventario-angular',
-        'iat'  => $now,
-        'exp'  => $now + JWT_EXP,
-        'uid'  => $logged['id'],
-        'name' => $logged['username'],
-        'role' => $logged['role']
-    ];
+        $db = initDB();
+        $now = time();
 
-    $jwt = JWT::encode($payload, JWT_KEY, JWT_ALG);
+        $jwt = createAccessToken((int) $logged['id']);
+
+        $refreshToken = createRefreshToken();
+
+        $refreshTokenHash = hash('sha256', $refreshToken);
+
+        $refreshExpiresAt = $now + REFRESH_TOKEN_EXP;
+
+        // Eliminar refresh tokens vencidos
+
+        $stmt = $db->prepare('DELETE FROM refresh_tokens WHERE expires_at <= :now');
+
+
+        if (!$stmt) {
+            throw new RuntimeException('Could not prepare refresh token cleanup');
+        }
+
+
+        $stmt->bindValue(':now', $now, SQLITE3_INTEGER);
+
+        if (!$stmt->execute()) {
+
+            throw new RuntimeException('Could not remove expired refresh tokens');
+
+        }
+
+        // Guardar hash del refresh token
+
+        $stmt = $db->prepare(
+            'INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (:token_hash, :user_id, :expires_at)');
+
+        if (!$stmt) {
+            throw new RuntimeException('Could not prepare refresh token insert');
+        }
+
+
+        $stmt->bindValue(':token_hash', $refreshTokenHash, SQLITE3_TEXT);
+
+        $stmt->bindValue(':user_id', (int) $logged['id'], SQLITE3_INTEGER);
+
+        $stmt->bindValue(':expires_at', $refreshExpiresAt, SQLITE3_INTEGER);
+
+        if (!$stmt->execute()) {
+            throw new RuntimeException('Could not save refresh token');
+        }
+
+        // Crear cookie HttpOnly
+
+        if (!setRefreshTokenCookie( $refreshToken, $refreshExpiresAt ) ){
+            throw new RuntimeException( 'Could not create refresh token cookie' ); 
+        }
+
+
+        /*
+        $cookieCreated = setcookie(
+            REFRESH_COOKIE_NAME,
+            $refreshToken,
+            [
+                'expires' => $refreshExpiresAt,
+                'path' => '/',
+                'secure' => REFRESH_COOKIE_SECURE,
+                'httponly' => true,
+                'samesite' => 'Lax'
+            ]
+        );
+
+
+        if (!$cookieCreated) {
+
+            throw new RuntimeException(
+                'Could not create refresh token cookie'
+            );
+
+        }
+
+        */
+
+        outputJson(['success' => true, 'jwt' => $jwt], 200);
+
+
+    } catch (Throwable $error) {
+
+        error_log('Login error: ' . $error->getMessage());
+
+
+        outputJson([
+            'success' => false,
+            'error' => [ 'code' => 'INTERNAL_ERROR', 'message' => 'Internal server error' ]], 500);
+
+    }
+}
+
+
+
+function deleteLogin()
+{
+    $refreshToken = $_COOKIE[ REFRESH_COOKIE_NAME ] ?? null;
+
+    // El navegador siempre pierde primero su refresh token.
+    clearRefreshTokenCookie();
+
+    if (!isValidRefreshToken($refreshToken)) {
+        outputJson(['success' => true], 200);
+    }
+
+
+    try {
+
+        $refreshTokenHash = hash('sha256', $refreshToken);
+        $db = initDB();
+        $stmt = $db->prepare('DELETE FROM refresh_tokens WHERE token_hash = :token_hash');
+
+        if (!$stmt) {
+            throw new RuntimeException('Could not prepare refresh token deletion');
+        }
+
+        $stmt->bindValue(':token_hash', $refreshTokenHash, SQLITE3_TEXT);
+
+        if (!$stmt->execute()) {
+            throw new RuntimeException('Could not revoke refresh token');
+        }
+
+        outputJson(['success' => true ], 200);
+
+    } catch (Throwable $error) {
+
+        error_log('Logout error: ' . $error->getMessage());
+
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'INTERNAL_ERROR', 'message' => 'Could not revoke refresh token']], 500);
+
+    }
+}
+
+function postRefresh()
+{
+    $refreshToken = $_COOKIE[REFRESH_COOKIE_NAME] ?? null;
+
+    if (!isValidRefreshToken($refreshToken)) {
+    clearRefreshTokenCookie();
+    outputJson([
+        'success' => false,
+        'error' => ['code' => 'INVALID_REFRESH_TOKEN', 'message' => 'Refresh token expired or invalid']], 401);
+    }
+
+
+    $refreshTokenHash = hash('sha256', $refreshToken);
+
+
+    $db = initDB();
+
+
+    $stmt = $db->prepare('SELECT user_id FROM refresh_tokens WHERE token_hash = :token_hash AND expires_at > :now LIMIT 1');
+
+    if (!$stmt) {
+        outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Internal server error']], 500);
+    }
+
+
+    $stmt->bindValue(':token_hash', $refreshTokenHash, SQLITE3_TEXT);
+    $stmt->bindValue(':now', time(), SQLITE3_INTEGER);
+
+    $result = $stmt->execute();
+
+    if (!$result) {
+        outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Internal server error']], 500);
+    }
+
+
+    $storedToken = $result->fetchArray(SQLITE3_ASSOC);
+
+    if (!$storedToken) {
+        clearRefreshTokenCookie();
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'INVALID_REFRESH_TOKEN', 'message' => 'Refresh token expired or invalid']], 401);
+
+    }
+
+    $jwt = createAccessToken((int) $storedToken['user_id']);
+
 
     outputJson(['success' => true, 'jwt' => $jwt], 200);
 }
 
+
 function requireLogin()
 {
-    try {
+    $payload = decodeLoginToken();
 
-        $headers = getallheaders();
+    $db = initDB();
 
-        $authorization = $headers['Authorization'] ?? null;
+    $stmt = $db->prepare('SELECT role FROM users WHERE id = :id');
 
-        if (!$authorization) {
-            throw new Exception('Authorization header missing');
-        }
-        //control con expresion regular del formato del Bearer + Token
-        if (!preg_match('/^Bearer\s+(.+)$/i', $authorization, $matches)) {
-            throw new Exception('Invalid Authorization header');
-        }
-
-        $jwt = trim($matches[1]);
-
-        if ($jwt === '') {
-            throw new Exception('Empty token');
-        }
-
-        $decoded = JWT::decode($jwt, JWT_KEY, [JWT_ALG]);
-
-        if (!isset($decoded->uid) || !isset($decoded->exp) || !isset($decoded->role)) {
-            throw new Exception('Invalid token claims');
-        }
-
-        if (!is_numeric($decoded->uid) || (int) $decoded->uid <= 0) {
-            throw new Exception('Invalid user ID in token');
-        }
-
-
-        if (!is_numeric($decoded->role) || !in_array((int) $decoded->role, [1, 2, 3], true)) {
-            throw new Exception('Invalid user role in token');
-        }
-
-        $GLOBALS['requestLogUsername'] = isset($decoded->name) && is_string($decoded->name) ? $decoded->name : 'user#' . (int) $decoded->uid;
-
-
-        return $decoded;
-
-    } catch (Exception $e) {
-        error_log('Authentication error: ' . $e->getMessage());
-        outputJson(['success' => false, 'error' => ['code' => 'UNAUTHORIZED', 'message' => 'Authentication required']], 401);
+    if (!$stmt) {
+        outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Internal server error']], 500);
     }
+
+    $stmt->bindValue(':id', (int) $payload->uid, SQLITE3_INTEGER);
+
+    $result = $stmt->execute();
+
+    if (!$result) {
+        outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Internal server error']], 500);
+    }
+
+    $user = $result->fetchArray(SQLITE3_ASSOC);
+
+    if (!$user) {
+        outputJson(['success' => false, 'error' => ['code' => 'UNAUTHORIZED', 'message' => 'User no longer exists']], 401);
+    }
+
+    $payload->role = (int) $user['role'];
+    return $payload;
 }
 
 
@@ -572,6 +750,38 @@ function getCheckStatus()
 
     outputJson(['success' => true, 'data' => ['user' => $user]], 200);
 }
+
+
+function decodeLoginToken(): object
+{
+    try {
+
+        $headers = array_change_key_case(getallheaders(), CASE_LOWER);
+        $authorization = $headers['authorization'] ?? '';
+
+        if (!preg_match('/^Bearer\s+(.+)$/i', $authorization, $matches)) {
+            throw new RuntimeException('Missing or invalid Authorization');
+        }
+
+        $jwt = trim($matches[1]);
+
+        $payload = JWT::decode($jwt, JWT_KEY, [JWT_ALG]);
+
+        if (!isset($payload->uid, $payload->exp) || !is_int($payload->uid) || $payload->uid <= 0 || !is_int($payload->exp) || $payload->exp <= time()) {
+            throw new RuntimeException('Invalid token claims');
+        }
+
+        return $payload;
+
+    } catch (Throwable $error) {
+
+        error_log('Authentication error: ' . $error->getMessage());
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'UNAUTHORIZED', 'message' => 'Authentication required']], 401);
+    }
+}
+
 
 // ----------------- Profile ---------------------
 
@@ -681,22 +891,30 @@ function patchProfile()
                 'error' => ['code' => 'INVALID_FIELD', 'message' => "Field '$field' cannot be modified"]], 400);
         }
     }
-
+    
     if (array_key_exists('email', $data)) {
-        if (!is_string($data['email']) || !filter_var(trim($data['email']), FILTER_VALIDATE_EMAIL)) {
+        if (!is_string($data['email'])) {
             outputJson([
                 'success' => false,
                 'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email address']], 400);
         }
-
-        $data['email'] = trim($data['email']);
-    }
-
-    if (array_key_exists('password', $data)) {
-        if (!is_string($data['password']) || strlen($data['password']) < 8) {
+    
+        $data['email'] = strtolower(trim($data['email']));
+    
+        if ($data['email'] === '' || strlen($data['email']) > 254 || !filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
             outputJson([
                 'success' => false,
-                'error' => ['code' => 'INVALID_PASSWORD', 'message' => 'Password must contain at least 8 characters']], 400);
+                'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email address']], 400);
+        }
+    }
+    
+
+
+    if (array_key_exists('password', $data)) {
+        if (!is_string($data['password']) || strlen($data['password']) < 8 || strlen($data['password']) > 20) {
+            outputJson([
+                'success' => false,
+                'error' => ['code' => 'INVALID_PASSWORD', 'message' => 'Password must contain at least 8 characters and less or equal to 20']], 400);
         }
     }
 
@@ -708,75 +926,141 @@ function patchProfile()
     }
 
     try {
-        $conflict = findUserConflict($db, null, $data['email'] ?? null, $userId);
 
+        $stmt = $db->prepare('SELECT id, username, email, password, role, user_image, created_at FROM users WHERE id = :id');
+
+        if (!$stmt) {
+            throw new Exception('Could not prepare current profile query');
+        }
+    
+        $stmt->bindValue(':id', $userId, SQLITE3_INTEGER);
+    
+        $result = $stmt->execute();
+    
+        if (!$result) {
+            throw new Exception('Could not retrieve current profile');
+        }
+    
+        $currentUser = $result->fetchArray(SQLITE3_ASSOC);
+    
+        if (!$currentUser) {
+            $db->exec('ROLLBACK');
+            outputJson(['success' => false, 'error' => ['code' => 'USER_NOT_FOUND', 'message' => 'User not found']], 404);
+        }
+    
+        $conflict = findUserConflict($db, null, $data['email'] ?? null, $userId);
+    
         if ($conflict !== null) {
             $db->exec('ROLLBACK');
             outputJson(['success' => false, 'error' => $conflict], 409);
         }
-
+    
+    
         $updates = [];
         $params = [];
-
+        $updatedFields = [];
+    
         foreach ($allowedFields as $field) {
+    
             if (!array_key_exists($field, $data)) {
                 continue;
             }
-            $updates[] = "$field = :$field";
-            $params[$field] = $field === 'password' ? password_hash($data[$field], PASSWORD_DEFAULT) : $data[$field];
+    
+            $newValue = $data[$field];
+            $currentValue = $currentUser[$field];
+            
+            if ($field === 'password') {
+
+                if (password_verify($newValue, $currentValue)) {
+            
+                    $db->exec('ROLLBACK');
+                    outputJson(['success' => false, 'error' => ['code' => 'PASSWORD_UNCHANGED', 'message' => 'New password must be different from the current password']], 409);
+                }
+            
+                $updates[] = 'password = :password';
+                $params['password'] = password_hash($newValue, PASSWORD_DEFAULT);
+                $updatedFields[] = 'password';
+            
+                continue;
+            }
+    
+            if ($newValue !== $currentValue) {
+    
+                $updates[] = "$field = :$field";
+                $params[$field] = $newValue;
+                $updatedFields[] = $field;
+            }
         }
-
+    
+        if (empty($updatedFields)) {
+    
+            unset($currentUser['password']);
+            $currentUser['id'] = (int) $currentUser['id'];
+            $currentUser['role'] = (int) $currentUser['role'];
+            $db->exec('COMMIT');
+    
+            outputJson(['success' => true, 'data' => ['user' => $currentUser, 'updated' => []]], 200);
+        }
+    
         $sql = 'UPDATE users SET ' . implode(', ', $updates) . ' WHERE id = :id';
-
         $stmt = $db->prepare($sql);
-
+    
         if (!$stmt) {
             throw new Exception('Could not prepare profile update');
         }
-
+    
         foreach ($params as $field => $value) {
             $stmt->bindValue(":$field", $value, SQLITE3_TEXT);
         }
-
+    
         $stmt->bindValue(':id', $userId, SQLITE3_INTEGER);
-
+    
         if (!$stmt->execute()) {
             throw new Exception('Could not update profile');
         }
-
+    
         $stmt = $db->prepare('SELECT id, username, email, role, user_image, created_at FROM users WHERE id = :id');
-
+    
         if (!$stmt) {
             throw new Exception('Could not prepare updated profile query');
         }
-
+    
         $stmt->bindValue(':id', $userId, SQLITE3_INTEGER);
+    
         $result = $stmt->execute();
-
+    
         if (!$result) {
             throw new Exception('Could not retrieve updated profile');
         }
-
+    
         $user = $result->fetchArray(SQLITE3_ASSOC);
-
+    
         if (!$user) {
             throw new Exception('Updated user not found');
         }
-
+    
         $user['id'] = (int) $user['id'];
         $user['role'] = (int) $user['role'];
-
+    
+    
         if (!$db->exec('COMMIT')) {
             throw new Exception('Could not commit profile update');
         }
-
-        outputJson(['success' => true, 'data' => ['user' => $user, 'updated' => array_keys($params)]], 200);
-
+    
+    
+        outputJson(['success' => true, 'data' => ['user' => $user, 'updated' => $updatedFields]], 200);
+    
     } catch (Exception $e) {
+
         $db->exec('ROLLBACK');
+
         error_log($e->getMessage());
-        outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Could not update profile']], 500);
+
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Could not update profile']], 500);
     }
+    
 }
 
 
@@ -862,78 +1146,17 @@ function postProfilePhoto()
 
 
 
-// ----------------- Auditar (solo Admin)------------------
-
-function getLogs()
-{
-    requireRole([1]);
-    respondWithLogs();
-}
-
-function getLogsByName($name)
-{
-    requireRole([1]);
-    respondWithLogs(trim((string) $name));
-}
-
-function respondWithLogs(?string $name = null): never
-{
-    try {
-        $db = initDB();
-        $db->enableExceptions(true);
-
-        $sql = 'SELECT id, username, action, method, ip, created_at FROM logs';
-
-        if ($name !== null && $name !== '') {
-            $sql .= ' WHERE username LIKE :name COLLATE NOCASE';
-        }
-
-        $sql .= ' ORDER BY id DESC LIMIT 200';
-
-        $stmt = $db->prepare($sql);
-
-        if ($name !== null && $name !== '') {
-            $stmt->bindValue(':name', '%' . $name . '%', SQLITE3_TEXT);
-        }
-
-        $result = $stmt->execute();
-
-        $logs = [];
-
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $row['id'] = (int) $row['id'];
-            $logs[] = $row;
-        }
-
-        $result->finalize();
-        $stmt->close();
-        $db->close();
-
-    } catch (Throwable $e) {
-        error_log('Read logs error: ' . $e->getMessage());
-        outputJson([
-            'success' => false,
-            'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Could not retrieve logs']], 500);
-    }
-
-    outputJson(['success' => true, 'data' => $logs]);
-}
-
-
-// ----------------- Api ------------------
-
 function getUsers() {
 
     requireRole([1]);
 
-	$bd = initDB();
-	$result = $bd->query('SELECT id, username, email, role, user_image, created_at FROM users');
+	$db = initDB();
+	$result = $db->query('SELECT id, username, email, role, user_image, created_at FROM users');
 
     if (!$result) {
         error_log($db->lastErrorMsg());
         outputJson(['success' => false, 'error' => ['code' => 'DATABASE_ERROR', 'message' => 'Internal server error']], 500);
     }
-
 
 	$ret = [];
 	while ($fila = $result->fetchArray(SQLITE3_ASSOC)) {
@@ -947,9 +1170,9 @@ function getUsers() {
 function getUsersById($id)
 {
     requireRole([1]); 
-    $bd=initDB();
+    $db=initDB();
     $sql = "SELECT id, username, email, role, user_image, created_at FROM users WHERE id =:id";
-    $stmt = $bd->prepare($sql);
+    $stmt = $db->prepare($sql);
 
     if (!$stmt) {
         error_log($db->lastErrorMsg());
@@ -979,8 +1202,8 @@ function getUsersById($id)
 function getUsersByName($name)
 {
     requireRole([1]); 
-    $bd=initDB();
-    $stmt = $bd->prepare("SELECT id, username, email, role, user_image, created_at FROM users WHERE username LIKE :name COLLATE NOCASE");
+    $db=initDB();
+    $stmt = $db->prepare("SELECT id, username, email, role, user_image, created_at FROM users WHERE username LIKE :name COLLATE NOCASE");
 
     if (!$stmt) {
         error_log($db->lastErrorMsg());
@@ -1005,7 +1228,9 @@ function getUsersByName($name)
     }
 
     if (!$ret) {
-        outputError(404);
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'USER_NOT_FOUND', 'message' => 'User not found']], 404);
     }
 
 
@@ -1047,6 +1272,7 @@ function postUsers()
         }
 
         $data[$field] = trim($data[$field]);
+
         if ($data[$field] === '') {
 
             outputJson(['success' => false, 'error' => ['code' => 'INVALID_FIELD', 'message' => "Invalid value for field: $field"]], 400);
@@ -1054,14 +1280,31 @@ function postUsers()
         }
     }
 
+    $data['username'] = strtolower($data['username']);
+    $data['email'] = strtolower($data['email']);
 
-    if (!filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
+    
+    if ($data['username'] === '' || strlen($data['username']) > 20 || strlen($data['username']) < 3) {
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'INVALID_USERNAME', 'message' => 'Username must be between 3 and 20 characters']], 400);
+    }
+
+    if (!filter_var($data['email'], FILTER_VALIDATE_EMAIL) || strlen($data['email']) > 254) {
 
         outputJson(['success' => false, 'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email']], 400);
 
     }
 
-    if (filter_var($data['role'], FILTER_VALIDATE_INT) === false) {
+
+    if (strlen($data['password']) < 8 || strlen($data['password']) > 20) {
+        outputJson([
+            'success' => false,
+            'error' => ['code' => 'INVALID_PASSWORD', 'message' => 'Password must contain at least 8 characters and equal or less than 20']], 400);
+    }
+
+
+    if (filter_var($data['role'], FILTER_VALIDATE_INT) === false || !in_array((int) $data['role'], [1, 2, 3], true)) {
 
         outputJson(['success' => false, 'error' => ['code' => 'INVALID_ROLE', 'message' => 'Invalid role']], 400);
 
@@ -1069,8 +1312,8 @@ function postUsers()
 
     $role = (int) $data['role'];
 
-    //TODO in email: MaxLength validator, Regex pattern validator(^[a-zA-Z0-9.@_%+-]+$)
-    //TODO in password: MinLenght MaxLength validator, Regex pattern validator (^[a-zA-Z0-9.@_%+-]+$)
+    //TODO in email: Regex pattern validator(^[a-zA-Z0-9.@_%+-]+$)
+    //TODO in password: Regex pattern validator (^[a-zA-Z0-9.@_%+-]+$)
     
     $upload = null;
 
@@ -1114,7 +1357,6 @@ function postUsers()
         }
 
         $stmt->bindValue(':username', $data['username'], SQLITE3_TEXT);
-
         $stmt->bindValue(':email', $data['email'], SQLITE3_TEXT);
         $stmt->bindValue(':password', password_hash($data['password'], PASSWORD_DEFAULT), SQLITE3_TEXT);
         $stmt->bindValue(':role', $role, SQLITE3_INTEGER);
@@ -1384,34 +1626,45 @@ function patchUsersById($id)
 
     if (array_key_exists('username', $data)) {
 
-        if (!is_string($data['username']) || trim($data['username']) === '')
+        if (!is_string($data['username']))
         {
             outputJson(['success' => false, 'error' => ['code' => 'INVALID_USERNAME', 'message' => 'Invalid username']], 400);
         }
 
-        $data['username'] = trim($data['username']);
-    }
+        $data['username'] = strtolower(trim($data['username']));
+        
 
+        if ($data['username'] === '' || strlen($data['username']) > 20 || strlen($data['username']) < 3) {
+            outputJson([
+                'success' => false,
+                'error' => ['code' => 'INVALID_USERNAME', 'message' => 'Username must be between 3 and 20 characters']], 400);
+        }
+
+    }
 
     if (array_key_exists('email', $data)) {
 
-        if (!is_string($data['email']) || !filter_var($data['email'], FILTER_VALIDATE_EMAIL))
-        {
-
-            outputJson(['success' => false, 'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email address']], 400);
-
+        if (!is_string($data['email'])) {
+            outputJson([
+                'success' => false,
+                'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email address']], 400);
         }
-
-        $data['email'] = trim($data['email']);
-
+    
+        $data['email'] = strtolower(trim($data['email']));
+    
+        if ($data['email'] === '' || strlen($data['email']) > 254 || !filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
+            outputJson([
+                'success' => false,
+                'error' => ['code' => 'INVALID_EMAIL', 'message' => 'Invalid email address']], 400);
+            }
     }
 
     if (array_key_exists('password', $data))
     {
 
-        if (!is_string($data['password']) ||strlen($data['password']) < 8)
+        if (!is_string($data['password']) || strlen($data['password']) < 8 || strlen($data['password']) > 20)
         {
-            outputJson(['success' => false, 'error' => ['code' => 'INVALID_PASSWORD', 'message' => 'Password must contain at least 8 characters']], 400);
+            outputJson(['success' => false, 'error' => ['code' => 'INVALID_PASSWORD', 'message' => 'Password must contain at least 8 characters and less or equal to 20']], 400);
         }
     }
 
@@ -2393,8 +2646,8 @@ function getSubscriptions() {
 
     requireRole([1,2,3]);
 
-    $bd = initDB();
-    $result = $bd->query($sql = '
+    $db = initDB();
+    $result = $db->query($sql = '
     SELECT s.id, s.user_id, s.stock_id,
         u.username, u.email, u.user_image,
         st.imei, st.model, st.brand, st.ph_provider, st.phone_image, st.line, st.line_provider
@@ -2425,6 +2678,7 @@ function getSubscriptions() {
 function getSubscriptionsByName($username)
 {
     requireRole([1, 2, 3]);
+
     $username = trim((string) $username);
     if ($username === '') {
         outputJson([
@@ -2731,6 +2985,7 @@ function deleteSubscriptions()
 
     outputJson(['success' => true, 'data' => ['deleted_count' => count($idArray), 'ids' => $idArray]]);
 }
+
 
 
 ?>
